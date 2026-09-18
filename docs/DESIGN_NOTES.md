@@ -343,7 +343,145 @@ the print with a ruler.
 
 ---
 
-## 6. Open questions / known limitations
+## 7. Step 3 — detection and 6D pose
+
+### 7.1 Why fiducial markers first
+
+Markers are not the impressive answer; a learned 6D pose estimator is. They are
+the right answer *first* for a reason that outweighs impressiveness.
+
+A pick-and-place pipeline has five stages that can each be wrong, and an error
+at the gripper is **indistinguishable between them**. Markers give a perception
+stage whose accuracy is known, bounded, and independently verifiable — so when
+the arm misses, perception can be ruled *out* and the search moves to hand-eye.
+Start with a learned estimator and every failure is a four-way argument.
+
+They also give the rest of the pipeline something to be graded against: the
+colour/plane path is scored against marker poses, and Step 4's hand-eye
+calibration is driven by them.
+
+### 7.2 Reprojection error is the confidence signal, not the detector score
+
+A detector score answers "is this a marker?". It says nothing about whether the
+recovered *geometry* is sane. The failure modes that hurt a robot are geometric:
+a marker seen through motion blur decodes perfectly and yields a tilted pose.
+Its reprojection error rises; its detection score does not.
+
+So `PoseEstimatorNode` gates on reprojection RMSE, in pixels — a unit we can
+threshold and reason about.
+
+### 7.3 The planar two-fold ambiguity
+
+A planar target viewed near-frontally has **two** poses that project to almost
+the same image, mirrored through the marker plane. This is genuine geometry, not
+numerical noise, and it is worst exactly when the marker is small, far, or
+square-on — the normal tabletop case. Picking wrong flips the approach axis and
+the gripper dives in tilted. The classic symptom is a pose that flickers between
+two orientations frame to frame.
+
+`SOLVEPNP_IPPE_SQUARE` via `solvePnPGeneric` returns **both** solutions; the
+default `ITERATIVE` flag converges to one local minimum and gives no hint that
+another existed. That silence is the problem. We compare residuals and flag when
+the runner-up explains the image nearly as well. Measured error ratio vs. tilt:
+
+| Tilt | error ratio | flagged |
+|---|---|---|
+| 0° | 1.09 | **yes** |
+| 5° | 2.95 | **yes** |
+| 15° | 11.2 | no |
+| 30° | 47.8 | no |
+| 45° | 52.4 | no |
+
+Ambiguous poses are published **flagged, not dropped** — the task layer can move
+the camera and look again, which perception cannot. An honest "I am not sure"
+beats a confident coin flip when the consequence is a collision.
+
+### 7.4 Monocular pose error is anisotropic — measured, not asserted
+
+Depth is recovered from a marker's apparent *size*, so a pixel of corner noise
+gives `dZ ≈ Z²/(s·fx)` against a lateral `dx ≈ Z/fx`. The ratio is **Z/s**.
+
+Monte-Carlo over 25 noise realisations, comparing measured spread to prediction:
+
+| Marker | Distance | measured dZ/dx | predicted Z/s |
+|---|---|---|---|
+| 30 mm | 0.4 m | 14.8× | 13.3× |
+| 30 mm | 1.0 m | 29.6× | 33.3× |
+| 50 mm | 0.7 m | 13.6× | 14.0× |
+
+The 1/s law is near-exact (measured 1.68× vs. predicted 1.67× for 30 mm vs.
+50 mm), and Z² holds. Three design consequences we actually act on:
+
+- **Approach along the camera axis** where possible, so the badly-known
+  direction is absorbed by the approach rather than becoming a lateral miss.
+- **Bigger markers beat closer cameras** — `dZ ∝ 1/s` is cheaper to fix.
+- **Never reach open-loop from one monocular view.** Step 6 servos.
+
+**Sim flattery, quantified.** Absolute magnitudes came in ~20× *below*
+prediction because synthetic corner refinement achieves ≈0.015 px where a real
+camera gives 0.1–0.5 px. The scaling laws transfer; the absolute numbers do not.
+Step 7 must report both.
+
+### 7.5 Two conventions, two bugs
+
+**A marker facing the camera is rotated 180° about X, not identity.** The ArUco
+marker frame's +Z points *out toward the viewer*; the camera's +Z points *into
+the scene*. My test fixture used identity, which renders the marker mirrored —
+and a mirrored marker does not decode at all, so every single view came back
+"NOT DETECTED". Caught by projecting the model points and noticing the corner
+labelled TL had the *largest* image y.
+
+**Plane offset sign depended on where the plane came from.** Lifting the support
+plane by half an object's height must move it *toward* the camera. But
+`offset_by(+h/2)` moves along the normal, and a normal's direction is an
+accident of construction — `Plane.from_pose` takes the frame's +Z, while a
+fitted plane's normal could point either way. So the same call removed the bias
+in one case and **doubled** it in the other. Replaced with
+`offset_toward_camera()`, which encodes the *intent* rather than the sign.
+
+### 7.6 The bias that averaging cannot remove
+
+For a box of height *h* on a table, the centroid of its **silhouette** is up the
+object's side, not on the table. Intersecting that ray with the table surface
+gives a point pulled toward the camera — proportional to *h* and to how
+obliquely you look. It is **systematic, not noise**, so averaging over frames
+does not remove it, and it is the right size to make a gripper clip the near
+edge. Handled by lifting the plane by *h*/2, which requires knowing *h* — stated
+as an explicit argument rather than hidden.
+
+### 7.7 Plane lifting conditioning
+
+Ray–plane intersection gives depth from a single view, but `t = c/(n·d)`
+explodes as the ray flattens. Measured, 1 px of noise at image centre:
+
+| Incidence | 3D displacement |
+|---|---|
+| 90° (looking down) | 0.67 mm |
+| 30° | 1.33 mm |
+| 8° | 4.79 mm |
+
+Conditioning is set entirely by camera *mounting*, so no detector improvement
+fixes it. `intersect()` refuses below 10° rather than returning a confident
+number.
+
+### 7.8 What the colour path deliberately cannot do
+
+A bounding box has four numbers; a pose has six. Orientation is not recoverable
+from an axis-aligned box at all — a square seen rotated has the same bbox. So
+`ColorDetector` emits `model_points=None` and `pose_from_detection` **refuses**
+it with an error that explains why. The constraint has to come from somewhere
+explicit (the table plane), and markers are easier precisely because they carry
+their own.
+
+HSV over RGB because hue separates from brightness, so a threshold survives
+illumination change. Its hard limit, stated rather than tuned around: hue is
+meaningless at low saturation, so greys/whites/blacks are undetectable and a
+specular highlight on a red cube reads as "not red". The honest fix is a learned
+detector — the natural upgrade path.
+
+---
+
+## 8. Open questions / known limitations
 
 - **No inter-node parallelism.** See 3.6. Fine for one laptop; would need
   revisiting for a real multi-rate control stack.
@@ -363,6 +501,21 @@ the print with a ruler.
   object it introduces a skew our pinhole model cannot represent.
 - **Sim renders are noiseless pinholes** — zero distortion, perfect focus, no
   motion blur. `SimCameraSource(noise_std=...)` adds Gaussian noise, but that
-  is a poor stand-in for the real failure modes. Sim numbers will flatter us
-  and Step 7 must say so.
+  is a poor stand-in for the real failure modes. Quantified in 7.4: synthetic
+  corner noise is ~0.015 px against 0.1–0.5 px for a real camera, so sim
+  flatters absolute accuracy by roughly 20×. Step 7 must report both.
+- **No temporal filtering of poses.** Each frame is solved independently. A
+  static object would benefit from averaging, and a moving one from a constant
+  velocity filter — but note (7.6) that the plane-lift bias is systematic and
+  would survive any amount of averaging.
+- **Ambiguity is flagged but not yet resolved.** The task layer is supposed to
+  request a second viewpoint. Until Step 6 exists, an ambiguous pose simply
+  carries a flag nobody acts on.
+- **`AMBIGUITY_RATIO = 3.0` is judgement, not measurement.** Chosen
+  conservatively (a false alarm costs one camera move; a missed ambiguity costs
+  a collision). The measured ratios in 7.3 separate cleanly at ±15°, so the
+  exact value matters little in that regime — but it has not been swept the way
+  the Step 2 gates were.
+- **The colour detector is a demo, not a product.** See 7.8: it cannot handle
+  uncoloured objects at all, and its HSV bands need per-cell tuning.
 - *(later steps append here)*
