@@ -106,6 +106,101 @@ to defend.
 
 ---
 
-## 3. Open questions / known limitations
+## 3. Step 1 — the runtime spine
 
-- *(to be filled as we build — each step appends here)*
+### 3.1 One naming rule for transforms
+
+`T_a_b` maps points from frame `b` into frame `a`; `p_a = T_a_b @ p_b`. Read
+"a from b". Composition then cancels like fractions — `T_a_b @ T_b_c = T_a_c` —
+and the same object is *also* the pose of `b` expressed in `a`. Both readings
+are true, and being able to say why is worth more than memorising the rule.
+
+**Enforced, not just documented:** `SE3` carries optional `parent`/`child`
+labels and raises `FrameMismatch` when inner frames disagree. Composing
+`T_base_cam @ T_tag_cam` is a plain matrix multiply in numpy — it returns
+garbage silently. Now it raises.
+
+**Cost:** we gave up raw 4×4 arrays, which compose with `@` and pass straight
+to cv2/MuJoCo. `.as_matrix()` is the one-call escape hatch, deliberately
+explicit so library boundaries stay greppable.
+
+### 3.2 Quaternion order is in the function name
+
+scipy/ROS use `(x,y,z,w)`; MuJoCo uses `(w,x,y,z)`. There is no `from_quat` —
+only `from_quat_xyzw` and `from_quat_wxyz`. Verbose on purpose: you cannot pass
+the wrong order without typing the wrong word.
+
+### 3.3 `camera_link` vs `camera_optical`
+
+Same physical point, different axis conventions: robotics is X-forward/Y-left/
+Z-up, OpenCV is Z-forward/X-right/Y-down. A fixed non-identity rotation sits
+between them permanently. Forgetting it gives a pose at a plausible distance
+but rotated ~90°, in a direction that changes as the camera moves — people
+"fix" it with a fudge factor and never recover. It is a named constant with
+per-axis tests.
+
+### 3.4 Tree, not graph
+
+One path between any two frames, so the answer is unique. A general graph
+permits two paths that disagree — which is exactly what happens once you have
+both a hand-eye calibration and a fiducial estimate of the same camera pose.
+`set_transform` enforces single-parent so you must *choose* which is
+authoritative. `detach()` makes deliberate re-parenting (object → gripper on
+grasp) explicit.
+
+### 3.5 Time buffering, and refusing to extrapolate
+
+Encoders run ~500 Hz, PnP ~15 Hz, and a PnP result is stamped when its *image*
+was captured — 30–80 ms in the past. Resolving it needs where the arm was *then*.
+On a moving arm that differs by centimetres, so the TF buffer interpolates
+between bracketing samples. This is the difference between a pipeline that
+works only when stationary and one that works while moving.
+
+Lookups past the newest sample **raise** rather than falling back to "latest".
+Extrapolating robot state is guessing about the future position of a heavy
+machine; failing lets the caller wait or abort. tf2 made the same call.
+
+### 3.6 Single-threaded executor
+
+**Gained:** bit-reproducible runs. Same seed, same inputs, same trajectory —
+which is what makes the Step 7 grasp-success number mean anything, and what
+turns a failure into something reproducible rather than a story.
+
+**Lost:** no real parallelism; throughput is bounded by the slowest callback.
+Mitigated by counting timer overruns, so "the detector missed 12% of its 15 Hz
+deadlines" stays observable even though nothing ran concurrently.
+
+**Exit path:** a thread-pool executor changes `runtime/executor.py` only —
+*provided* nodes obeyed the no-shared-mutable-state rule.
+
+### 3.7 Bug found and fixed: timer deadline drift
+
+The executor advanced deadlines with `next_due += period`. Since 0.01 is not
+exactly representable in binary floating point, 100 accumulations give
+`1.0000000000000007` — so a 100 Hz timer spun for exactly 1.0 s fired **99**
+times.
+
+What makes it worth recording: a 10 Hz timer accumulates to
+`0.9999999999999999`, erring the *other* way, so it fired the correct 10. The
+bug **passed the 10 Hz test and failed only at 100 Hz**. A single-rate test
+suite would have shipped it, and it would have resurfaced much later as an
+off-by-one in a frame count where nobody suspects the clock.
+
+**Fix:** keep an integer tick index, derive `start + n * period`. Error is
+bounded at one rounding instead of growing with n — what real-time schedulers
+do. Plus a 1 ns epsilon at the spin boundary so one ulp does not decide whether
+the final tick fires. Regression test sweeps 14 rates from 1–500 Hz.
+
+---
+
+## 4. Open questions / known limitations
+
+- **No inter-node parallelism.** See 3.6. Fine for one laptop; would need
+  revisiting for a real multi-rate control stack.
+- **Bus fan-out is synchronous**, so a slow subscriber blocks its publisher.
+  Acceptable given single-threading, but it means callback cost is a latency
+  budget item, not just a throughput one.
+- **TF interpolation is linear** (LERP + SLERP). For a fast-moving arm between
+  widely spaced samples this under-models the actual path; at 500 Hz encoder
+  rates the error is negligible.
+- *(later steps append here)*
