@@ -8,3 +8,4 @@ data/recordings/*
 !data/recordings/.gitkeep
 eval/out/*
 !eval/out/.gitkeep
+src/*.egg-info/
