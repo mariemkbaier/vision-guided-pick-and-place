@@ -1,0 +1,113 @@
+# Vision-Guided Pick-and-Place
+
+An end-to-end computer-vision and robotics pipeline: a camera looks at a table,
+a 6-DoF arm picks a named object and places it in a bin. No privileged
+information anywhere in the loop — the robot finds the camera's position by
+calibrating, finds the object by looking, and knows when not to trust what it
+sees.
+
+Built to be **explained**, not just to run. [`docs/DESIGN_NOTES.md`](docs/DESIGN_NOTES.md)
+records every decision, its alternative, and what choosing it cost — including
+the twelve bugs found along the way, each of which is now a regression test.
+
+```
+ frame:     image px       camera 3D      robot base      joint space
+           ┌─────────┐   ┌───────────┐  ┌───────────┐  ┌────────────┐
+ camera ──▶│ detect  │──▶│  6D pose  │─▶│ transform │─▶│ IK + plan  │──▶ grasp
+           └─────────┘   └───────────┘  └───────────┘  └────────────┘
+             ArUco         PnP +          hand-eye        damped
+                           ambiguity      AX = XB         least squares
+```
+
+The hard part is not any single box. It is that **an error in any one of them
+is indistinguishable from an error in the others** at the gripper. The eval
+harness exists to attribute error to the right stage.
+
+## Quick start
+
+```bash
+python3.12 -m venv .venv && ./.venv/bin/pip install -r requirements.txt -e .
+
+./.venv/bin/python scripts/run_demo.py                  # full pipeline
+./.venv/bin/python scripts/run_demo.py --true-handeye    # skip calibration
+./.venv/bin/python eval/run_eval.py --trials 20          # measured results
+./.venv/bin/python -m pytest tests/ -m "not slow"        # fast tests
+```
+
+Real-camera path (needs a printed target):
+
+```bash
+./.venv/bin/python scripts/make_target.py --sensor 1280x720 --square-mm 15
+./.venv/bin/python scripts/calibrate_intrinsics.py --square-size-m 0.015
+```
+
+## What it does, stage by stage
+
+| Stage | Module | What it produces |
+|---|---|---|
+| Runtime | [`runtime/`](src/vgp/runtime/) | Nodes, typed bus, transform tree, deterministic clock |
+| Sensing | [`sensors/`](src/vgp/sensors/) | One `CameraSource` over MuJoCo and a real webcam |
+| Intrinsics | [`calib/intrinsics.py`](src/vgp/calib/intrinsics.py) | K and distortion, with gates that catch degenerate data |
+| Detection | [`perception/aruco.py`](src/vgp/perception/aruco.py) | 2D corners with known 3D model points |
+| 6D pose | [`perception/pnp.py`](src/vgp/perception/pnp.py) | Pose + reprojection error + ambiguity flag |
+| Hand-eye | [`calib/handeye.py`](src/vgp/calib/handeye.py) | `T_tool_camera`, by solving `AX = XB` |
+| Kinematics | [`robot/`](src/vgp/robot/) | FK, Jacobian, damped-least-squares IK, collision |
+| Planning | [`planning/`](src/vgp/planning/) | Time-parameterised joint and Cartesian trajectories |
+| Task | [`task/pick_place.py`](src/vgp/task/pick_place.py) | State machine that decides whether to act |
+
+## Design decisions worth defending
+
+**The transform tree is the single source of truth for geometry.** `SE3` carries
+frame labels and *refuses* to compose mismatched frames — `T_base_cam @ T_tag_cam`
+is a legal numpy matmul that returns silent garbage, and now raises. Quaternion
+order is in every function name (`from_quat_xyzw` vs `from_quat_wxyz`) because
+scipy and MuJoCo disagree and a silent swap is a plausible-looking wrong rotation.
+
+**Poses are resolved at the image's timestamp, not "now".** The detector runs at
+15 Hz and its output describes the world 30–80 ms ago; the arm moves at 100 Hz.
+The TF buffer interpolates between bracketing samples, which is the difference
+between a pipeline that works only when stationary and one that works in motion.
+It **refuses to extrapolate** — guessing the future position of a heavy machine
+is not a service worth providing.
+
+**Quality gates are on the data, not the residual.** Measured: a face-on
+calibration achieves 0.039 px reprojection error with a **28% focal-length
+error** — a *better* residual than the well-conditioned case at 0.043 px. The
+same logic governs hand-eye: rotating about a single axis leaves a whole
+one-parameter family of valid solutions, and the solver happily returns one.
+
+**The task layer refuses to act on poses it cannot trust** — stale, ambiguous,
+or high-residual. A planar marker viewed head-on has two PnP solutions mirrored
+about its plane; acting on the wrong one dives the gripper in tilted. Rather
+than guess, the arm views from 28° off-axis, which turns an error ratio of 1.09
+into 47.
+
+**It servos before it grasps.** Monocular depth error scales as `Z²/(s·fx)`
+while lateral is only `Z/fx` — measured 14.8× anisotropy at 0.4 m. Reaching
+open-loop from one distant view bets the grasp on the worst-measured axis, so
+the arm re-observes from close range first.
+
+## Measured results
+
+20 randomised trials per condition (object position and yaw random, plus a
+distractor). Runs are bit-reproducible — see §3.6 of the design notes.
+
+See [`eval/out/results.json`](eval/out/results.json) for the current numbers,
+regenerated by `eval/run_eval.py`.
+
+## Known limitations
+
+Stated plainly, because the gap between this and a production cell is the most
+interesting part of the project. Full list in §12 of the design notes.
+
+- **Sim flatters us by ~20×** on absolute perception accuracy: synthetic ArUco
+  corner refinement reaches ≈0.015 px where a real camera gives 0.1–0.5 px. The
+  *scaling laws* transfer; the absolute numbers do not.
+- **No collision-aware path planning** — only collision *checking* at IK
+  solutions. There is no RRT; a straight-line Cartesian path that passes through
+  an obstacle is detected and refused, not routed around.
+- **One camera, one arm, single-threaded.** Bought reproducibility, gave up
+  parallelism.
+- **The colour detector is a demo.** It cannot see uncoloured objects at all —
+  an inherent limit of hue thresholding, not a tuning problem. A learned
+  detector is the natural upgrade, and the `Detector` interface is where it goes.

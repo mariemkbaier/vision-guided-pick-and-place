@@ -481,7 +481,270 @@ detector — the natural upgrade path.
 
 ---
 
-## 8. Open questions / known limitations
+## 9. Step 4 — hand-eye calibration
+
+### 9.1 The step that makes perception actionable
+
+Steps 2–3 give an object's pose in the **camera** frame. The robot moves in its
+**base** frame. Nothing connects them, and no amount of better perception will —
+a perfect 6D pose in the wrong frame is useless.
+
+Eye-in-hand formulation: at each pose, `A_i = T_base_tool` (from FK, essentially
+exact) and `B_i = T_cam_target` (from PnP). The marker does not move, so
+`A_i X B_i` is constant, giving the classical `AX = XB`.
+
+### 9.2 Why two independent solvers
+
+We implement Park & Martin's method *and* call `cv2.calibrateHandEye`. Two
+implementations with no shared code path check each other; one implementation
+agreeing with itself checks nothing.
+
+That paid for itself immediately. Our first result was 103 mm off with a 180°
+rotation error — and the cross-check disagreed by *exactly* the amount we were
+wrong, which localised the bug to our code rather than the data. Cause: in
+`A_j⁻¹A_i · X = X · B_j B_i⁻¹`, the two sides compose **the other way round**
+from each other — `A` is `(older)⁻¹(newer)` while `B` is `(older)(newer)⁻¹`.
+Pattern-matching the `A` form onto `B` gives `B⁻¹`. Derive it; don't copy it.
+
+### 9.3 Rotate about two non-parallel axes, or `X` is not identifiable
+
+Pure geometry, not numerics. With rotations about one axis only, *any* `X`
+composed with an extra rotation about that axis fits equally well — an entire
+one-parameter family of perfect solutions. The solver does not fail; it returns
+a family member with an excellent residual.
+
+Measured with near-single-axis motions: **94 mm of error** in the recovered `X`,
+while the residual read 7.5 mm. The Step 2 lesson in a new costume — *the
+residual cannot tell you the problem was well-posed.* Hence a hard
+`rotation_axis_spread` gate, computed from the data before any solve, so it can
+be reported while still collecting.
+
+### 9.4 Result
+
+Full loop in sim — render → detect → PnP → solve, starting from a nominal mount
+guess **11.2 mm / 5.6° wrong**:
+
+| | value |
+|---|---|
+| Recovered `X` vs ground truth | **0.207 mm / 0.020°** |
+| Target-pose scatter across 15 poses | 0.339 mm / 0.106° |
+| Our solver vs OpenCV | 0.363 mm / 0.021° |
+
+### 9.5 The bug that a "sensible default" caused
+
+Two of eighteen views produced 127 mm and 149 mm pose errors — with residuals of
+0.03 px, confidence ratios of 76, and no ambiguity flag. Nothing downstream could
+have caught them.
+
+Cause, in two parts. First, `detections[0]` is not "the marker you want" — it is
+whatever the contour scan found first, and those two views saw only the *cube*
+markers, not the calibration one. Second, the detector applied a **default marker
+size** to unregistered ids, so a 33 mm marker was measured as 40 mm.
+
+A guessed size does not fail. It produces a pose with a perfect reprojection
+error, scaled wrong along the view ray, completely confident. The fix is Step 2's
+rule again: **`default_size_m=None` refuses to guess**, and a `select(dets,
+label)` helper exists so "take the first one" is never the path of least
+resistance.
+
+---
+
+## 10. Step 5 — kinematics, planning, and control
+
+### 10.1 Writing our own IK turned out to be the gain
+
+MuJoCo has no IK, which forced the derivation PyBullet's one-liner would have
+hidden. Damped least squares replaces each singular value σ with `σ/(σ²+λ²)`:
+for σ ≫ λ that is the exact inverse, and as σ → 0 it goes to **0 instead of ∞**.
+The solver smoothly gives up on directions the arm cannot move in, rather than
+commanding unbounded velocity. A slightly wrong pose beats a robot flinging
+itself at its velocity limit.
+
+Three things had to be added before it actually worked, each found by measurement:
+
+**Nullspace leak (0.42 mm → 0.0002 mm).** The projector is built from the
+*damped* inverse, so it is only approximately orthogonal to the task. Far from
+the target that is irrelevant; near it the leak is the same size as the residual
+and the solve stalls. Fading the secondary objective out as error shrinks keeps
+posture shaping where it helps and removes it where it hurts.
+
+**Joint-limit masking.** Clamping `q` after the step is not enough — a joint *on*
+its limit still has a non-zero Jacobian column, so the solver keeps allocating
+motion to a joint that cannot move, and the clamp silently truncates it. Symptom:
+IK stalls with one joint pinned and a few degrees of orientation error that no
+number of iterations removes. Zeroing those columns tells the solver the truth.
+
+**Collision checking.** See 10.3.
+
+Result: **8/8 targets solved, 7–99 µm**, converging in 8–106 iterations.
+
+### 10.2 Spend the task's symmetries before blaming the solver
+
+A parallel-jaw gripper is 180°-symmetric about its approach axis — swapping which
+finger is on which side grasps the same object identically. A square cube adds
+90°, giving four equivalent yaws.
+
+That is not cosmetic. Measured: a top-down grasp at (0.30, 0, 0.15) with yaw 0
+requires a wrist roll of *exactly π* — the Y-Z-Y wrist's gimbal lock. The
+equivalent grasp at yaw π needs roll 0 and is trivially conditioned. **Same
+physical grasp.** Enumerating the symmetry took IK success from 5/8 to 7/8 for
+free.
+
+General lesson: when IK fails, first ask whether the *task* really required that
+exact pose, or whether you over-specified it.
+
+### 10.3 The bug that presented four layers away
+
+An "observation pose" with j4 = 259° satisfied the target pose exactly, respected
+every joint limit, and was perfectly well-conditioned — and folded the wrist
+through the forearm. IK reported success, the controller commanded it, and the
+arm **stopped 2.6 rad short**.
+
+Nothing errored. The actuators saturated against the contact constraint —
+measured `actuator_force` +200 N·m exactly cancelled by `qfrc_constraint`
+−199.4 N·m — so the robot sat still while the controller insisted it was
+commanding correctly. The failure surfaced as *"the camera cannot see the
+object"*, because the arm was not where anyone thought it was.
+
+Widening the wrist limits to ±2π (realistic for a UR-style arm) is what made
+these wound-up solutions reachable, so the fix is not narrower limits — it is
+checking collision at IK solutions.
+
+Getting that check right needed two model fixes. Adjacent links overlap **by
+construction** (our spherical wrist packs link 4/5/6 at nearly one point), and
+the two fingers interpenetrated at qpos 0. Without the `<contact><exclude>` set
+and the finger offset, *every* configuration reported as colliding — including
+HOME.
+
+### 10.4 Trapezoidal vs quintic — the actual trade
+
+A path says *where*; a trajectory says *when*. Handing a controller bare
+waypoints pushes the velocity decision somewhere invisible.
+
+| | duration | peak v used | peak a used |
+|---|---|---|---|
+| Trapezoidal | 1.167 s | 76% | 98% |
+| Quintic | 1.387 s | 90% | 75% |
+
+Trapezoidal is time-optimal for the given bounds but has discontinuous
+acceleration — infinite jerk at the corners. Quintic has zero jerk at the
+endpoints and is **19% slower** for the same limits, because it ramps instead of
+cruising. Free transit uses trapezoidal; approach and retreat near the object use
+quintic.
+
+### 10.5 Gravity compensation: 6.8 mm → 0.0 mm
+
+A bare position servo must generate holding torque from *position error alone* —
+the arm sags until `kp·error` balances gravity. Measured 6.8 mm of TCP droop at a
+typical grasp configuration.
+
+6.8 mm sounds small until you notice the gripper has ~10 mm of clearance per side
+around a 50 mm cube. The fingers then descend off-centre, catch the cube's edge
+and shove it aside — which presents as a *perception or calibration* error rather
+than a control one. Feeding forward `qfrc_bias` (gravity + Coriolis) removes it
+entirely, and is what every industrial controller does.
+
+---
+
+## 11. Step 6 — the task layer, and four things it refuses to do
+
+### 11.1 Why servoing is the central design decision
+
+Step 3 measured monocular depth uncertainty at ~`Z/s` times lateral, growing as
+`Z²`. Reaching open-loop from one distant observation bets the grasp on the
+worst-measured axis. So the arm moves to a stand-off, **re-observes from ~0.15 m
+instead of ~0.40 m**, and only then descends. Closing the distance 2.5× improves
+depth certainty ~6× — more than any detector improvement would.
+
+### 11.2 The refusals
+
+The task acts only on poses that are fresh, unambiguous, and low-residual. Each
+refusal is logged with a reason, because "we saw it but the pose was 0.4 s old"
+and "we never saw it" need completely different fixes.
+
+The ambiguity refusal immediately proved its worth, by making the pipeline fail:
+looking straight down at a planar marker is *exactly* the degenerate case, so
+every frame was flagged and the arm correctly would not move.
+
+The right response was not to relax the gate. It was to **change the viewpoint** —
+28° off-axis turns an error ratio of 1.09 into 47. When an estimator is
+ill-conditioned, the cheapest fix is usually the viewpoint, not the estimator.
+Having the camera on a robot is precisely the freedom to do that.
+
+### 11.3 Three bugs that only an integrated system reveals
+
+**Search is a motion, not a wait.** With eye-in-hand the camera only sees where
+the arm puts it. From HOME it sees *nothing* — the objects are outside its 58°
+cone. And the search window was originally measured from when the move was
+*commanded*, so it expired before the arm arrived: the task reported "never saw
+the object" having looked for zero seconds. One fixed vantage point also left 25%
+of randomised placements unseen; three are used now.
+
+**The marker is not the object.** The fiducial is on the cube's *top face*, so
+grasping at the measured pose put the fingertips on the top millimetre. This
+*passed* the holding check — the fingers were genuinely blocked — lifted the cube
+successfully, and dropped it partway through the transport move. Found by logging
+the object's position per state and watching it reappear on the table 100 mm from
+the bin. The fix is a known property of the object model, not something
+perception can discover.
+
+**Pose the camera, not the tool.** The camera sits 55 mm off the tool axis and
+pitched 22°, so putting the *gripper* above the object puts the *camera* looking
+110 mm to one side of it. At a 150 mm stand-off the object is simply out of
+frame — "lost sight of the target while servoing", with nothing wrong except
+aiming the wrong frame.
+
+**And a two-stage approach is not optional.** Servoing from a tilted viewpoint
+means a single Cartesian move to the grasp travels *diagonally*, straight through
+the side of the object. Measured: the fingers shoved the cube 14 mm and forced
+themselves open to 74 mm. Hence PREGRASP (directly above, joint-space) then
+DESCEND (purely vertical, Cartesian).
+
+### 11.4 A frame bug that the frame system was built to catch
+
+Hand-eye necessarily produces `tool0 → camera_**optical**` (PnP's frame), but the
+published TF chain is `tool0 → camera_link → camera_optical`. Inserting the
+hand-eye result as the *first* hop applies the optical rotation **twice**.
+
+It does not error. It produced object positions that were plausible — right
+magnitude, wrong place: (0.73, −0.14, 0.66) for a cube actually at
+(0.33, 0.12, 0.03) — and the only symptom was "no IK solution", four layers from
+the cause.
+
+The uncomfortable part: `SE3` would have caught this, and did not, because the
+call site passed hand-written `parent=`/`child=` arguments that *overrode* the
+labels. A safety mechanism you can bypass silently is one you will bypass.
+
+---
+
+## 12. Step 7 — evaluation
+
+### 12.1 Attribution, not a single number
+
+"87% grasp success" is nearly useless: in a five-stage pipeline every failure
+looks identical at the gripper. Each condition isolates one stage by removing its
+error and re-measuring — ground-truth vs calibrated hand-eye attributes Step 4's
+contribution, servo on/off quantifies closed-loop re-observation, and a noise
+sweep tests whether the task layer's gating actually catches degradation.
+
+Randomised object placement plus a **distractor** matters: the distractor is what
+makes `detections[0]` fail and what a too-wide gripper knocks over. A
+single-object benchmark hides both.
+
+### 12.2 A benchmark artefact, caught and fixed
+
+The first randomised runs threw `HandEyeError: need >= 3 poses` — a cube had
+landed on the calibration marker. That is a property of the *benchmark*, not of
+the pipeline, and counting it as a pipeline failure would have been dishonest.
+Scene generation now keeps objects clear of the target.
+
+Likewise the harness initially measured the wrong cube (a hardcoded index
+alongside a target label — two sources of truth) and reported a failure for a
+pick that had succeeded.
+
+---
+
+## 13. Open questions / known limitations
 
 - **No inter-node parallelism.** See 3.6. Fine for one laptop; would need
   revisiting for a real multi-rate control stack.
@@ -518,4 +781,23 @@ detector — the natural upgrade path.
   the Step 2 gates were.
 - **The colour detector is a demo, not a product.** See 7.8: it cannot handle
   uncoloured objects at all, and its HSV bands need per-cell tuning.
-- *(later steps append here)*
+- **No collision-aware path PLANNING** — only collision *checking* at IK
+  solutions and along Cartesian waypoints. There is no RRT: a straight line
+  through an obstacle is detected and refused, never routed around. That is the
+  largest single gap between this and a production cell.
+- **Grasp pose selection is top-down only.** Real bin picking needs grasp
+  synthesis over arbitrary approach directions; `grasp.py` raises on anything
+  but `-z`.
+- **No force feedback during the grasp.** Success is inferred from finger
+  position (they stopped short, so something is between them), which is what a
+  real gripper's position feedback gives — but a force/torque sensor would catch
+  a slipping object mid-transport, which we currently cannot.
+- **Dynamics are unmodelled in planning.** Trajectories respect joint velocity
+  and acceleration limits but not payload-dependent torque limits; carrying a
+  heavier object would need re-timing.
+- **Hand-eye is calibrated once, offline.** Real cells need to detect when it has
+  drifted (a knock to the camera mount). The target-scatter residual would show
+  it, but nothing monitors it online.
+- **The `SE3` frame check can be bypassed** by passing explicit `parent`/`child`
+  at a call site, which is exactly how the double-optical-rotation bug (11.4)
+  slipped through. A stricter API would make overriding labels harder.

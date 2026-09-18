@@ -85,10 +85,27 @@ class ArucoDetector:
     def __init__(
         self,
         specs: dict[int, MarkerSpec] | None = None,
-        default_size_m: float = 0.04,
+        default_size_m: float | None = None,
         dictionary: int = DEFAULT_DICT,
         refine: bool = True,
     ) -> None:
+        """`default_size_m=None` (the default) REFUSES to guess a size.
+
+        An unregistered marker is still reported as a detection, but with
+        `model_points=None`, so PnP declines it rather than producing a pose.
+
+        WHY THIS IS THE RIGHT DEFAULT -- it cost us a debugging session.
+        A guessed marker size does not fail. It produces a pose with a
+        PERFECT reprojection error, scaled wrong along the view ray, and
+        completely confident. In our hand-eye run two views caught a 33 mm cube
+        marker while a 40 mm default was assumed: 127 mm and 149 mm of pose
+        error, residuals of 0.03 px, and the ambiguity check clean (ratio 76).
+        Nothing downstream could have caught it.
+
+        This is Step 2's "no guessed intrinsics for a real camera" rule again:
+        a confidently wrong number is worse than a refusal, because a refusal
+        is visible.
+        """
         self.specs = specs or {}
         self.default_size_m = default_size_m
         self._dict = cv2.aruco.getPredefinedDictionary(dictionary)
@@ -112,7 +129,8 @@ class ArucoDetector:
         out: list[Detection2D] = []
         if ids is not None:
             for c, i in zip(corners, ids.ravel()):
-                spec = self.specs.get(int(i), MarkerSpec(self.default_size_m, f"tag{int(i)}"))
+                known = self.specs.get(int(i))
+                spec = known or MarkerSpec(self.default_size_m or 0.0, f"tag{int(i)}")
                 pts = c.reshape(4, 2).astype(np.float64)
                 x0, y0 = pts.min(axis=0)
                 x1, y1 = pts.max(axis=0)
@@ -129,7 +147,12 @@ class ArucoDetector:
                     score=1.0,
                     bbox_xyxy=np.array([x0, y0, x1, y1]),
                     corners=pts,
-                    model_points=marker_model_points(spec.size_m),
+                    # No registered size -> no model points -> PnP refuses.
+                    model_points=(
+                        marker_model_points(spec.size_m)
+                        if (known is not None or self.default_size_m is not None)
+                        else None
+                    ),
                 ))
         return Detection2DArray(Header(image.header.stamp, image.header.frame_id), out)
 
@@ -141,3 +164,18 @@ def generate_marker(marker_id: int, pixels: int = 300, dictionary: int = DEFAULT
     img = cv2.aruco.generateImageMarker(d, marker_id, pixels)
     pad = int(pixels * quiet_zone_frac)
     return cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+
+
+def select(detections, label: str):
+    """Pick the detection with `label`, or None.
+
+    Exists because "take detections[0]" is the bug it looks like. Detection
+    order is whatever the detector's contour scan produced -- it is not
+    stability, priority, or proximity. In a scene with more than one marker
+    the first detection is simply the wrong one some of the time, and the
+    resulting pose is confident and wrong.
+    """
+    for d in detections:
+        if d.label == label:
+            return d
+    return None
