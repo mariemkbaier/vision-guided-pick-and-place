@@ -742,6 +742,61 @@ Likewise the harness initially measured the wrong cube (a hardcoded index
 alongside a target label — two sources of truth) and reported a failure for a
 pick that had succeeded.
 
+### 12.3 An ablation that ablated nothing
+
+The servo ablation initially disabled only the servo *iteration*, leaving the
+approach-to-stand-off in place — so the task still re-observed from 0.15 m. It
+produced medians identical to the control **to sixteen significant figures**,
+which is the only reason it was caught; it would otherwise have read as
+"servoing does not matter".
+
+An ablation that changes nothing measures nothing. Fixed to commit the grasp
+from the distant search observation, which is the genuine open-loop condition.
+
+### 12.4 Results, and what they do and do not show
+
+20 randomised trials per condition:
+
+| Condition | Success | Perception err (p50 / p90) | Grasp offset | Hand-eye |
+|---|---|---|---|---|
+| A. Ground-truth hand-eye | 100% | 1.29 / 1.34 mm | 0.16 mm | 0 |
+| B. Calibrated (full pipeline) | 100% | 0.96 / 2.04 mm | 0.08 mm | 0.57 mm |
+| C. Calibrated + noise σ=3 | 100% | 0.99 / 2.04 mm | 0.09 mm | 0.54 mm |
+| D. Calibrated + noise σ=8 | 100% | 1.02 / 3.12 mm | 0.10 mm | 0.55 mm |
+| E. No close-range servo | 100% | 1.83 / 2.91 mm | 0.68 mm | 0.54 mm |
+
+**E vs C** is the result worth quoting: close-range re-observation improves
+perception **1.9×** and grasp centring **7.6×**, which is the Step 3 depth
+anisotropy (`dZ ∝ Z²`) paying off exactly as predicted.
+
+**What this does not show.** 100% everywhere means the benchmark is not
+stressing the pipeline — a 50 mm cube on an empty table with a 70 mm gripper has
+generous margin. The error columns are the informative part, and they do degrade
+sensibly (p90 2.04 → 3.12 mm from σ=3 to σ=8). A harder benchmark would add
+clutter, occlusion, and objects near the workspace boundary.
+
+**Place error is deliberately not the headline metric.** It is dominated by how
+the cube settles after release, so a 20 mm place error next to a 2 mm one says
+almost nothing about which run perceived better. Choosing a metric that measures
+the thing you changed is part of the experiment design, not an afterthought.
+
+### 12.5 The twelve bugs, and why they are listed
+
+Every bug in these notes is now a regression test. They are kept in the document
+rather than quietly fixed because they share a structure worth internalising:
+
+**Eleven of twelve produced no error message.** They produced plausible numbers.
+A calibration with a beautiful residual and a 28% focal error; a pose with a
+0.03 px residual and 149 mm of error; an arm stalled 2.6 rad short with the
+controller reporting success; a quality metric that got worse as you collected
+more data; an ablation identical to its control.
+
+The lesson the project is built around: **in a geometry pipeline, wrong answers
+are usually self-consistent.** Almost every safeguard here — frame labels that
+refuse to compose, gates on data rather than residuals, two independent hand-eye
+solvers, ground truth on a channel perception cannot reach — exists to create an
+error message where there would otherwise be a plausible number.
+
 ---
 
 ## 13. Open questions / known limitations

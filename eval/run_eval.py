@@ -95,7 +95,14 @@ def run_condition(name: str, trials: int, seed0: int = 0, **kw) -> dict:
         "success_rate": len(ok) / len(rows),
         "place_err_mm_median": float(np.median([r.place_error_mm for r in ok])) if ok else None,
         "place_err_mm_p90": float(np.percentile([r.place_error_mm for r in ok], 90)) if ok else None,
+        # Perception error and grasp offset are the informative metrics for
+        # ablations. PLACE error is dominated by how the cube settles after
+        # release -- it measures bin dynamics more than pipeline accuracy, so a
+        # 20 mm place error next to a 2 mm one says almost nothing about which
+        # run perceived better.
         "perception_err_mm_median": float(np.nanmedian([r.perception_error_mm for r in rows])),
+        "perception_err_mm_p90": float(np.nanpercentile([r.perception_error_mm for r in rows], 90)),
+        "grasp_offset_mm_median": float(np.nanmedian([r.grasp_offset_mm for r in rows])),
         "handeye_err_mm": float(np.nanmedian([r.handeye_error_mm for r in rows])),
         "servo_correction_mm_median": float(np.median(
             [c for r in rows for c in r.servo_corrections_mm] or [np.nan])),
@@ -143,16 +150,15 @@ def main() -> None:
     Path(a.out).write_text(json.dumps(results, indent=2))
 
     print("\n" + "=" * 92)
-    print(f"{'condition':<48s} {'succ':>6s} {'place p50':>10s} {'place p90':>10s} "
-          f"{'percep':>8s} {'hand-eye':>9s}")
+    print(f"{'condition':<48s} {'succ':>6s} {'percep p50':>11s} {'percep p90':>11s} "
+          f"{'grasp off':>10s} {'hand-eye':>9s}")
     print("=" * 92)
     for r in results:
         if not r["trials"]:
             continue
-        p50 = f"{r['place_err_mm_median']:.1f}mm" if r["place_err_mm_median"] is not None else "-"
-        p90 = f"{r['place_err_mm_p90']:.1f}mm" if r["place_err_mm_p90"] is not None else "-"
-        print(f"{r['name']:<48s} {r['success_rate']:>5.0%} {p50:>10s} {p90:>10s} "
-              f"{r['perception_err_mm_median']:>7.2f}m {r['handeye_err_mm']:>8.2f}m")
+        print(f"{r['name']:<48s} {r['success_rate']:>5.0%} "
+              f"{r['perception_err_mm_median']:>10.2f}m {r['perception_err_mm_p90']:>10.2f}m "
+              f"{r['grasp_offset_mm_median']:>9.2f}m {r['handeye_err_mm']:>8.2f}m")
     print(f"\nwrote {a.out}")
 
 

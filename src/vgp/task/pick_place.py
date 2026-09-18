@@ -94,6 +94,15 @@ class TaskConfig:
     max_rmse_px: float = 1.5
     servo_tolerance_m: float = 0.004       # stop servoing when corrections are small
     max_servo_iters: int = 3
+    # False = commit the grasp from the DISTANT search observation, skipping the
+    # close-range approach entirely. The genuine open-loop ablation.
+    #
+    # An earlier version ablated only the servo ITERATION, leaving the
+    # approach-to-stand-off in place -- so the task still re-observed from
+    # 0.15 m and the "ablation" produced byte-identical results to the control.
+    # An ablation that changes nothing measures nothing, and this one looked
+    # like a finding until the two medians turned out to match to 16 digits.
+    use_servo: bool = True
     settle_time: float = 0.35              # let physics settle after a motion
     grip_time: float = 0.6
     home_q: np.ndarray | None = None
@@ -332,6 +341,12 @@ class PickPlaceNode(Node):
             self._search_deadline = self._wait_until + self.cfg.search_timeout_per_pose
             return
         self._target_pose_base = T
+        if not self.cfg.use_servo:
+            # ABLATION: commit from this distant view, no close-range look.
+            self.log("servo disabled: committing from the search observation", "warn")
+            self._command_gripper(approach_width(self.cfg.object_width))
+            self._commit_grasp(T)
+            return
         q = self._view_pose(T.t, self.cfg.standoff_m,
                             self.cfg.view_tilt_deg, self.cfg.view_azim_deg)
         if q is None:
@@ -380,6 +395,9 @@ class PickPlaceNode(Node):
             return
 
         # Converged: commit to a grasp pose.
+        self._commit_grasp(T)
+
+    def _commit_grasp(self, T: SE3) -> None:
         yaw = float(np.arctan2(T.R[1, 0], T.R[0, 0]))
 
         # THE MARKER IS NOT THE OBJECT.

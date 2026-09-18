@@ -223,8 +223,7 @@ def run_demo(
         # max_servo_iters=0 disables the close-range re-observation, so the
         # task commits to the FIRST distant estimate. The ablation that
         # quantifies what closed-loop re-observation actually buys.
-        max_servo_iters=(3 if servo else 0),
-        servo_tolerance_m=(0.004 if servo else 1e9),
+        use_servo=servo,
     )))
 
     ex.start()
