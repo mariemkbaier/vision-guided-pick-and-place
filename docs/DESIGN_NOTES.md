@@ -193,7 +193,157 @@ the final tick fires. Regression test sweeps 14 rates from 1–500 Hz.
 
 ---
 
-## 4. Open questions / known limitations
+## 5. Step 2 — camera sources and intrinsic calibration
+
+### 5.1 One `CameraSource` interface, and ground truth kept off it
+
+Sim and webcam implement the same `read() -> (Image, CameraInfo)`. If the sim
+path went through different code, every sim result would carry an asterisk —
+you could never tell whether a real-world failure was the environment or the
+untested branch.
+
+Privileged simulator state (exact camera pose, exact object poses) is exposed
+on a **separate** `ground_truth()` channel, never through `read()`. If it
+flowed through the normal message path a perception node could consume it — by
+accident or by a well-meaning shortcut — and every accuracy number afterwards
+would measure nothing. Physical separation makes that impossible rather than
+merely discouraged.
+
+`read()` returns intrinsics with *every* frame rather than once at startup.
+Autofocus shifts fx/fy; any resize rescales all four of fx, fy, cx, cy. Data
+and the calibration that interprets it travel together or they drift apart.
+
+### 5.2 Two conventions verified against rendered pixels, not against argument
+
+A sign error in a camera convention is *self-consistent*: the image renders
+fine, PnP reports low reprojection error, and only the robot is wrong. So both
+were checked against actual pixels.
+
+**Principal point.** In OpenCV a pixel coordinate is its *centre*, so an image
+of W pixels spans `[-0.5, W-0.5]` and the centre is `(W-1)/2`, not `W/2`.
+Measured with a marker on the optical axis:
+
+| Hypothesis | Predicted | Error vs. rendered |
+|---|---|---|
+| `(W-1)/2` → 319.5 | `[319.5, 239.5]` | **0.000 px** |
+| `W/2` → 320.0 | `[320.0, 240.0]` | 0.707 px |
+
+Half a pixel sounds ignorable. It is a *systematic* bias that PnP converts into
+a constant pose offset, later misattributed to hand-eye calibration.
+
+**MuJoCo/OpenGL → OpenCV.** MuJoCo looks down −Z with +Y up; OpenCV looks down
++Z with +Y down. The mapping is `diag(1,-1,-1)` — a 180° rotation about X, det
++1. (`diag(1,1,-1)` is the natural typo and is a *reflection*, which `SE3`
+rejects.) Verified by checking that world +Y renders *above* image centre and
+world +X to the right.
+
+`fovy → fy = (H/2)/tan(fovy/2)` reprojects to 0.02–0.06 px against rendered
+markers — that residual is centroid estimation on a finite sphere, not model
+error.
+
+### 5.3 The headline result: RMSE cannot tell you a calibration is good
+
+Photograph a planar board face-on and focal length trades off against distance:
+a board twice as far with twice the focal length makes nearly the same image.
+The optimiser lands somewhere on that valley and reports a beautiful residual.
+
+Measured against a known `fx = 780`, 20 views each:
+
+| Views | Reprojection RMSE | fx error |
+|---|---|---|
+| Face-on only | 0.039 px | **28.2 %** |
+| Tilted ≤ 35° | 0.043 px *(worse!)* | **0.04 %** |
+
+**The well-conditioned calibration has the higher residual.** You cannot
+distinguish these by looking at the number everyone reports. This is why every
+gate below is on the **data**, not on the residual.
+
+Threshold set by sweeping tilt span, 5 seeds each:
+
+| Tilt span | median fx err | worst fx err |
+|---|---|---|
+| 0.0° | 6.7 % | 7.8 % |
+| 5.2° | 0.3 % | 1.0 % |
+| 10.4° | 0.2 % | **24.4 %** |
+| 26.1° | 0.02 % | 0.08 % |
+
+The median recovers by ~6°, but the **worst case stays erratic until ~26°**.
+We gate on the worst case: a calibration you cannot trust to be good is not
+good. Hence `MIN_TILT_SPAN_DEG = 25`.
+
+### 5.4 Two bugs found, both silent
+
+**Distortion applied with the removal map.** `render_view` used
+`initUndistortRectifyMap`, which answers the *reverse* question (for each
+ideal pixel, where to sample in a distorted source — what you want when
+rectifying a real photo). Feeding an ideal render through it applies the
+*inverse* distortion. It does not crash; it produces a plausibly barrel-warped
+image, and the calibrator then faithfully recovered `k1 = +0.15` for a true
+`−0.15`. **Sign-flipped, not noisy** — which is why the test now asserts on the
+sign explicitly. Fixed by building the map from `undistortPoints` over the
+output grid.
+
+**A quality metric that punished collecting more data.** `edge_coverage` was
+the *fraction of corners* in the outer margin. Going 15 → 40 views:
+
+| Views | hull coverage | edge corner-fraction |
+|---|---|---|
+| 15 | 52 % | 4.0 % |
+| 30 | 57 % | 2.3 % |
+| 40 | 58 % | 2.6 % |
+
+Coverage improved while "edge coverage" got *worse*, because each extra view
+adds mostly central corners and dilutes the ratio. Had we gated on it, we would
+have coached operators to stop early. Replaced with **grid-cell occupancy**
+(fraction of 8×6 cells, and of border cells, containing ≥1 corner), which is
+monotone in effort — a new view can fill a cell, never empty one. A convex hull
+was rejected for a related reason: it measures *extent*, so a ring of corners
+scores 100 % with an empty middle.
+
+### 5.5 Board aspect ratio is a property of the target, not the operator
+
+`findChessboardCorners` is all-or-nothing, so every view must fit **entirely**
+in frame — quiet zone included. An aspect mismatch therefore wastes the
+difference on *every single view*, and no amount of technique recovers it.
+Measured on a 960×540 (16:9) sensor over 30 visibility-checked views:
+
+| Board | bordered aspect | cell coverage | border cells |
+|---|---|---|---|
+| 9×6 | 1.38 | 52 % | 2.3 % |
+| 11×6 | 1.62 | 58 % | 3.9 % |
+| 12×7 | 1.56 | 60 % | 4.4 % |
+
+The classic 9×6 board is 3:2 — fine on an old 4:3 camera, a permanent handicap
+on a 16:9 one. `recommend_board()` picks a matched shape; the target generator
+and the calibration CLI both default to it.
+
+### 5.6 Visibility-aware pose sampling
+
+The test fixture originally jittered board position laterally, which silently
+clipped **~45 % of views** (measured) — and the survivors were the central,
+low-coverage ones. Worst of both, and invisible: you ask for 20 views, get 11,
+and the calibration is unstable for a reason that never appears in its output.
+`pose_grid` now rejection-samples against the projected board hull, which is
+also what a human does: slide the board toward the edge until it is about to
+leave frame, then stop.
+
+### 5.7 What we refuse to do
+
+**No guessed intrinsics for a real camera.** We could infer a plausible K from
+a typical FOV. A guessed K yields poses that are confidently wrong with a low
+residual — far worse than an error message. Sim gets exact intrinsics for free;
+real cameras must earn theirs.
+
+**`square_size_m` is the single scale reference** for the whole pipeline. Get
+it 10 % wrong and every object is 10 % too far away, permanently, with perfect
+residuals — the geometry stays self-consistent, just uniformly scaled. Hence
+the target generator prints the size on the board, warns when it will not fit
+the paper (because "fit to page" silently rescales), and tells you to measure
+the print with a ruler.
+
+---
+
+## 6. Open questions / known limitations
 
 - **No inter-node parallelism.** See 3.6. Fine for one laptop; would need
   revisiting for a real multi-rate control stack.
@@ -203,4 +353,16 @@ the final tick fires. Regression test sweeps 14 rates from 1–500 Hz.
 - **TF interpolation is linear** (LERP + SLERP). For a fast-moving arm between
   widely spaced samples this under-models the actual path; at 500 Hz encoder
   rates the error is negligible.
+- **Checkerboard, not ChArUco.** ChArUco tolerates partial occlusion, so the
+  board could leave the frame and still contribute — which would lift the
+  coverage ceiling (5.5) considerably. Checkerboard was chosen for a simpler
+  first pass; ChArUco is the clear upgrade and we already depend on
+  `cv2.aruco` for Step 3.
+- **Rolling shutter is unmodelled.** The webcam almost certainly has one. For a
+  static calibration board it does not matter; for pose estimation on a moving
+  object it introduces a skew our pinhole model cannot represent.
+- **Sim renders are noiseless pinholes** — zero distortion, perfect focus, no
+  motion blur. `SimCameraSource(noise_std=...)` adds Gaussian noise, but that
+  is a poor stand-in for the real failure modes. Sim numbers will flatter us
+  and Step 7 must say so.
 - *(later steps append here)*
