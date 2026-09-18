@@ -1,0 +1,67 @@
+[
+  {
+    "name": "A. ground-truth hand-eye (perception+control only)",
+    "trials": 20,
+    "success_rate": 1.0,
+    "place_err_mm_median": 1.44005613335721,
+    "place_err_mm_p90": 16.476095515563223,
+    "perception_err_mm_median": 1.2890577060576778,
+    "perception_err_mm_p90": 1.3423225516126316,
+    "grasp_offset_mm_median": 0.16170332093118478,
+    "handeye_err_mm": 0.0,
+    "servo_correction_mm_median": 1.0488004308106187,
+    "failures": {}
+  },
+  {
+    "name": "B. calibrated hand-eye (FULL pipeline)",
+    "trials": 20,
+    "success_rate": 1.0,
+    "place_err_mm_median": 1.2183262365385232,
+    "place_err_mm_p90": 14.550034520560112,
+    "perception_err_mm_median": 0.9586578781672472,
+    "perception_err_mm_p90": 2.037490217058729,
+    "grasp_offset_mm_median": 0.07858165782734575,
+    "handeye_err_mm": 0.5676037687515813,
+    "servo_correction_mm_median": 1.1511515690475238,
+    "failures": {}
+  },
+  {
+    "name": "C. calibrated + camera noise sigma=3",
+    "trials": 20,
+    "success_rate": 1.0,
+    "place_err_mm_median": 1.0774362022336628,
+    "place_err_mm_p90": 16.945632652908074,
+    "perception_err_mm_median": 0.9859184704122417,
+    "perception_err_mm_p90": 2.0407753894156127,
+    "grasp_offset_mm_median": 0.0913648797308857,
+    "handeye_err_mm": 0.5377264384434862,
+    "servo_correction_mm_median": 0.9977699416705135,
+    "failures": {}
+  },
+  {
+    "name": "D. calibrated + camera noise sigma=8",
+    "trials": 20,
+    "success_rate": 1.0,
+    "place_err_mm_median": 1.0158559956516913,
+    "place_err_mm_p90": 21.52486715523211,
+    "perception_err_mm_median": 1.0223282046664968,
+    "perception_err_mm_p90": 3.1210057857220606,
+    "grasp_offset_mm_median": 0.10366107513286872,
+    "handeye_err_mm": 0.5507098430154569,
+    "servo_correction_mm_median": 0.969560175372648,
+    "failures": {}
+  },
+  {
+    "name": "E. ABLATION: no close-range servo (open loop from first view)",
+    "trials": 20,
+    "success_rate": 1.0,
+    "place_err_mm_median": 0.915084859811139,
+    "place_err_mm_p90": 9.95991576320703,
+    "perception_err_mm_median": 1.833965132238671,
+    "perception_err_mm_p90": 2.914036435838797,
+    "grasp_offset_mm_median": 0.6848671485388116,
+    "handeye_err_mm": 0.5377264384434862,
+    "servo_correction_mm_median": NaN,
+    "failures": {}
+  }
+]

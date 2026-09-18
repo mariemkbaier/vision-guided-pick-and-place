@@ -8,4 +8,10 @@ data/recordings/*
 !data/recordings/.gitkeep
 eval/out/*
 !eval/out/.gitkeep
+# Measured results are a DELIVERABLE, not a build artifact -- the README
+# cites them and they are the evidence for every claim in the design notes.
+!eval/out/results.json
 src/*.egg-info/
+
+# Rendered demo videos are large; regenerate with scripts/record_demo.py
+data/recordings/*.mp4

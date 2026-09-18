@@ -150,17 +150,38 @@ def make_scan_qs(arm: Arm, points, X_tool_cam_optical: SE3,
     return tuple(out)
 
 
-def run_demo(
+@dataclass
+class Pipeline:
+    """Everything wired together, before it is run.
+
+    Exposed as a separate step from `run_demo` so a VIEWER can drive the same
+    pipeline the headless demo drives -- rather than a visualisation script
+    re-wiring its own copy, which would then drift out of sync with what the
+    tests actually exercise.
+    """
+
+    model: object
+    data: object
+    arm: Arm
+    camera: SimCameraSource
+    executor: Executor
+    task: PickPlaceNode
+    obj: ObjectSpec
+    scene: SceneSpec
+    handeye_error_mm: float
+    handeye_error_deg: float
+    object_start: np.ndarray
+
+
+def build_pipeline(
     scene: SceneSpec | None = None,
     target: str = "cube_1",
     object_index: int | None = None,
     use_true_hand_eye: bool = False,
     camera_noise: float = 0.0,
     servo: bool = True,
-    max_sim_time: float = 45.0,
     seed: int = 1,
-    verbose: bool = False,
-) -> DemoResult:
+) -> Pipeline:
     scene = scene or default_scene()
     model = mujoco.MjModel.from_xml_string(build_xml(scene))
     data = mujoco.MjData(model)
@@ -198,16 +219,14 @@ def run_demo(
     obj_start = arm.body_pose(obj.name).t.copy()
 
     # Vantage points covering the table, computed once at setup using whichever
-    # hand-eye estimate this run is using. One fixed viewpoint leaves part of
-    # the workspace outside the camera's cone -- measured as "never saw the
-    # object" on 25% of randomised trials.
+    # hand-eye estimate this run is using.
     scan_qs = make_scan_qs(arm, [(0.33, 0.02), (0.30, 0.16), (0.36, -0.14)], X_use)
     if not scan_qs:
         scan_qs = (OBSERVE_Q,)
 
     ex = Executor(SimClock())
-    robot = ex.add(RobotNode("robot", ex.bus, ex.tf, ex.clock, model, data, arm,
-                             T_tool_camera_optical=X_use, control_hz=100.0))
+    ex.add(RobotNode("robot", ex.bus, ex.tf, ex.clock, model, data, arm,
+                     T_tool_camera_optical=X_use, control_hz=100.0))
     ex.add(CameraNode("camera", ex.bus, ex.tf, ex.clock, cam, hz=15.0))
     ex.add(DetectorNode("detector", ex.bus, ex.tf, ex.clock,
                         ArucoDetector({o.marker_id: MarkerSpec(o.marker_size, "cube")
@@ -220,11 +239,27 @@ def run_demo(
         place_xy=scene.bin_pos,
         home_q=HOME_Q,
         scan_qs=scan_qs,
-        # max_servo_iters=0 disables the close-range re-observation, so the
-        # task commits to the FIRST distant estimate. The ablation that
-        # quantifies what closed-loop re-observation actually buys.
         use_servo=servo,
     )))
+    return Pipeline(model, data, arm, cam, ex, task, obj, scene, he_t, he_r, obj_start)
+
+
+def run_demo(
+    scene: SceneSpec | None = None,
+    target: str = "cube_1",
+    object_index: int | None = None,
+    use_true_hand_eye: bool = False,
+    camera_noise: float = 0.0,
+    servo: bool = True,
+    max_sim_time: float = 45.0,
+    seed: int = 1,
+    verbose: bool = False,
+) -> DemoResult:
+    p = build_pipeline(scene, target, object_index, use_true_hand_eye,
+                       camera_noise, servo, seed)
+    ex, task, arm, obj, obj_start = p.executor, p.task, p.arm, p.obj, p.object_start
+    he_t, he_r = p.handeye_error_mm, p.handeye_error_deg
+    scene = p.scene
 
     ex.start()
     while not task.finished and ex.clock.now() < max_sim_time:
