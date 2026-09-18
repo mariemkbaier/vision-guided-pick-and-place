@@ -1,0 +1,21 @@
+# ---------------------------------------------------------------------------
+# Pins carry reasons. See docs/DESIGN_NOTES.md "Dependency decisions".
+# ---------------------------------------------------------------------------
+
+numpy>=1.26,<3
+scipy>=1.11                    # Rotation/Slerp — never hand-roll quaternion math
+
+# opencv-contrib, NOT plain opencv-python: cv2.aruco is contrib-only since 4.7.
+# Capped <5 deliberately: OpenCV 5.0 ships the CALIB_HAND_EYE_* enums but DROPS
+# the calibrateHandEye() Python binding, which Step 4 depends on. Revisit when
+# the 5.x bindings are complete.
+opencv-contrib-python>=4.10,<5
+
+# MuJoCo, not PyBullet. PyBullet has no arm64 wheel for this macOS/Python combo
+# and its vendored zlib fails to compile against the macOS 26 SDK.
+mujoco>=3.2
+
+pyyaml>=6.0
+
+pytest>=8.0
+matplotlib>=3.8                # eval plots only — never on the perception hot path

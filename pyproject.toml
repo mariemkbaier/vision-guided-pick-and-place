@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vgp"
+version = "0.1.0"
+description = "Vision-Guided Pick-and-Place: end-to-end CV + robotics pipeline"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Keep failure output readable when a geometry assert trips.
+addopts = "-q --tb=short"
+markers = [
+    "slow: tests that step physics or render (deselect with -m 'not slow')",
+    "hardware: tests needing the real webcam (deselect with -m 'not hardware')",
+]
